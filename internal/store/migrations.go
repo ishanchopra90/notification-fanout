@@ -25,7 +25,28 @@ func ApplyMigrations(ctx context.Context, databaseURL string) error {
 	}
 	defer conn.Close(ctx)
 
-	return applyMigrationsFromFS(ctx, conn, os.DirFS("."), "migrations")
+	migrationsDir, err := detectMigrationsDir()
+	if err != nil {
+		return err
+	}
+
+	return applyMigrationsFromFS(ctx, conn, os.DirFS("."), migrationsDir)
+}
+
+func detectMigrationsDir() (string, error) {
+	candidates := []string{
+		"migrations",
+		"../migrations",
+		"../../migrations",
+	}
+
+	for _, dir := range candidates {
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			return dir, nil
+		}
+	}
+
+	return "", fmt.Errorf("could not locate migrations directory from current working directory")
 }
 
 func applyMigrationsFromFS(ctx context.Context, execer migrationExecer, fsys fs.FS, dir string) error {
