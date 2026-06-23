@@ -30,13 +30,13 @@ deployment.
 8. - [x] **Delivery worker pool** — claim due rows via `FOR UPDATE SKIP LOCKED`, POST to webhook with timeout, record `delivery_attempts`, update status (`delivered`/`retrying`/`failed`) with exponential backoff. **Unit tests** for backoff + status transitions.
 9. - [x] **Delivery audit API** — `GET /deliveries?event_id=|subscription_id=` returning status + attempt history. Unit tests for both query params + validation.
 10. - [x] **Health, readiness & graceful shutdown** — `/healthz`, `/readyz` (DB-gated), and `SIGTERM` drain (stop accepting, stop claiming, finish in-flight, close pool). Unit test readiness states.
-11. - [ ] **End-to-end tests (1–2)** — (a) ingest → fanout → deliver to a stub webhook server → assert audit shows `delivered`; (b) failing webhook → retry → `failed` after max attempts. Ensure they run and pass.
-12. - [ ] **Makefile targets** — provide and verify each target runs:
-    - [ ] `make lint` — run linters/`go vet` (and `gofmt`/`golangci-lint` if available).
-    - [ ] `make build` — compile all packages / the service binary.
-    - [ ] `make test` — run **all unit tests**.
-    - [ ] `make e2e` — run **all end-to-end tests**.
-13. - [ ] **README (MVP)** — setup/run instructions, filter rule syntax, and the "sacrifice vs. harden next" summary.
+11. - [x] **End-to-end tests (1–2)** — (a) ingest → fanout → deliver to a stub webhook server → assert audit shows `delivered`; (b) failing webhook → retry → `failed` after max attempts. Ensure they run and pass.
+12. - [x] **Makefile targets** — provide and verify each target runs:
+    - [x] `make lint` — run linters/`go vet` (and `gofmt`/`golangci-lint` if available).
+    - [x] `make build` — compile all packages / the service binary.
+    - [x] `make test` — run **all unit tests**.
+    - [x] `make e2e` — run **all end-to-end tests**.
+13. - [x] **README (MVP)** — setup/run instructions, filter rule syntax, and the "sacrifice vs. harden next" summary.
 
 > **MVP cutoff.** After task 13 the service satisfies the mandatory functional + engineering requirements locally with tests.
 

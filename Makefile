@@ -2,16 +2,28 @@ MODULE := github.com/notification-fanout/service
 BINARY := bin/notification-fanout
 DATABASE_URL ?= postgres://postgres:postgres@localhost:5432/notification_fanout?sslmode=disable
 
-.PHONY: run test migrate build tidy
+.PHONY: run lint build test e2e migrate tidy
 
 run: build
 	./$(BINARY)
+
+lint:
+	@unformatted=$$(gofmt -l .); \
+	if [ -n "$$unformatted" ]; then \
+		echo "Files need gofmt:"; \
+		echo "$$unformatted"; \
+		exit 1; \
+	fi
+	go vet ./...
 
 build:
 	go build -o $(BINARY) ./cmd/notification-fanout
 
 test:
 	go test ./...
+
+e2e:
+	go test ./e2e/...
 
 migrate:
 	@if [ -z "$(DATABASE_URL)" ]; then \

@@ -10,13 +10,13 @@ import (
 const ServiceName = "notification-fanout"
 
 const (
-	defaultDatabaseURL   = "postgres://postgres:postgres@localhost:5432/notification_fanout?sslmode=disable"
-	defaultPort          = 8080
-	defaultWorkerCount   = 4
-	defaultHTTPTimeout   = 10 * time.Second
-	defaultRequestTimeout = 30 * time.Second
+	defaultDatabaseURL     = "postgres://postgres:postgres@localhost:5432/notification_fanout?sslmode=disable"
+	defaultPort            = 8080
+	defaultWorkerCount     = 4
+	defaultHTTPTimeout     = 10 * time.Second
+	defaultRequestTimeout  = 30 * time.Second
 	defaultShutdownTimeout = 30 * time.Second
-	defaultLogLevel      = "info"
+	defaultLogLevel        = "info"
 )
 
 // Config holds runtime settings loaded from the environment.
@@ -59,9 +59,9 @@ func Load() (Config, error) {
 	}
 
 	for _, spec := range []struct {
-		name   string
-		value  *time.Duration
-		def    time.Duration
+		name  string
+		value *time.Duration
+		def   time.Duration
 	}{
 		{"HTTP_TIMEOUT", &cfg.HTTPTimeout, defaultHTTPTimeout},
 		{"REQUEST_TIMEOUT", &cfg.RequestTimeout, defaultRequestTimeout},

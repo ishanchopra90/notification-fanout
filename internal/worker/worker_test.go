@@ -16,12 +16,12 @@ import (
 )
 
 type fakeStore struct {
-	claimed      []store.ClaimedDelivery
-	attempts     []store.DeliveryAttempt
-	updated      []updateCall
-	claimErr     error
-	createErr    error
-	updateErr    error
+	claimed   []store.ClaimedDelivery
+	attempts  []store.DeliveryAttempt
+	updated   []updateCall
+	claimErr  error
+	createErr error
+	updateErr error
 }
 
 type updateCall struct {

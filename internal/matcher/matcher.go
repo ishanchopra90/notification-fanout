@@ -41,9 +41,9 @@ type Condition struct {
 }
 
 type rawFilter struct {
-	Type    *string         `json:"type"`
-	Source  *string         `json:"source"`
-	Payload map[string]any  `json:"payload"`
+	Type    *string        `json:"type"`
+	Source  *string        `json:"source"`
+	Payload map[string]any `json:"payload"`
 }
 
 // New returns a Matcher ready to evaluate filter rules.

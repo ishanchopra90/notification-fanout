@@ -16,11 +16,11 @@ import (
 )
 
 type fakeSubscriptionStore struct {
-	readyFn  func(ctx context.Context) error
-	createFn func(ctx context.Context, webhookURL string, filter json.RawMessage, eventType, source *string) (store.Subscription, error)
-	listFn   func(ctx context.Context) ([]store.Subscription, error)
-	deleteFn func(ctx context.Context, id int64) error
-	ingestFn func(ctx context.Context, idempotencyKey *string, eventType, source string, payload json.RawMessage) (store.IngestResult, error)
+	readyFn              func(ctx context.Context) error
+	createFn             func(ctx context.Context, webhookURL string, filter json.RawMessage, eventType, source *string) (store.Subscription, error)
+	listFn               func(ctx context.Context) ([]store.Subscription, error)
+	deleteFn             func(ctx context.Context, id int64) error
+	ingestFn             func(ctx context.Context, idempotencyKey *string, eventType, source string, payload json.RawMessage) (store.IngestResult, error)
 	listByEventFn        func(ctx context.Context, eventID int64) ([]store.Delivery, error)
 	listBySubscriptionFn func(ctx context.Context, subscriptionID int64) ([]store.Delivery, error)
 	listAttemptsFn       func(ctx context.Context, deliveryID int64) ([]store.DeliveryAttempt, error)
@@ -87,7 +87,7 @@ func TestNewRouter(t *testing.T) {
 		createFn: func(context.Context, string, json.RawMessage, *string, *string) (store.Subscription, error) {
 			return store.Subscription{}, nil
 		},
-		listFn: func(context.Context) ([]store.Subscription, error) { return nil, nil },
+		listFn:   func(context.Context) ([]store.Subscription, error) { return nil, nil },
 		deleteFn: func(context.Context, int64) error { return nil },
 		ingestFn: func(context.Context, *string, string, string, json.RawMessage) (store.IngestResult, error) {
 			return store.IngestResult{}, nil
@@ -275,7 +275,7 @@ func TestHandlersStoreError(t *testing.T) {
 		createFn: func(context.Context, string, json.RawMessage, *string, *string) (store.Subscription, error) {
 			return store.Subscription{}, errors.New("boom")
 		},
-		listFn: func(context.Context) ([]store.Subscription, error) { return nil, errors.New("boom") },
+		listFn:   func(context.Context) ([]store.Subscription, error) { return nil, errors.New("boom") },
 		deleteFn: func(context.Context, int64) error { return errors.New("boom") },
 		ingestFn: func(context.Context, *string, string, string, json.RawMessage) (store.IngestResult, error) {
 			return store.IngestResult{}, errors.New("boom")

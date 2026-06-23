@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pashagolub/pgxmock/v4"
 	"github.com/notification-fanout/service/internal/store"
+	"github.com/pashagolub/pgxmock/v4"
 )
 
 func TestNewRequiresPool(t *testing.T) {
