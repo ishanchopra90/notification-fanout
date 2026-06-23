@@ -45,7 +45,7 @@ deployment.
 ## Nice-to-have / Deployment / Extensions
 
 14. - [ ] **Dockerfile** — multi-stage build producing a small static image.
-15. - [ ] **GitHub Actions CI** — `go vet` + `go test ./...` with a Postgres service container on push.
+15. - [x] **GitHub Actions CI** — `go vet` + `go test ./...` with a Postgres service container on push.
 16. - [ ] **Kubernetes manifests (DOKS)** — `Deployment`, `Service`, `ConfigMap`/`Secret`, probes wired to `/healthz` & `/readyz`.
 17. - [ ] **Deploy to DOKS** — push image, apply manifests, verify end-to-end against the cluster.
 18. - [ ] **Metrics** — Prometheus `/metrics` (ingest rate, fanout size, delivery success/failure, retry depth).
