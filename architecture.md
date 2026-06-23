@@ -5,7 +5,7 @@
 > requirements, with clear seams where a production system would harden. Every base
 > design choice is called out with its trade-off in
 > [§3 Design decisions & trade-offs](#3-design-decisions--trade-offs) and revisited in
-> [§12 Harden next](#12-harden-next-revisiting-trade-offs--extensions).
+> [§14 Harden next](#14-harden-next-revisiting-trade-offs--extensions).
 
 ## 1. Overview
 
@@ -26,7 +26,7 @@ direct, indexed query per event — **no in-memory cache in the base design** (s
 ## 2. Design assumptions
 
 These assumptions justify the base design's simplifications. If they don't hold, the
-relevant [§12](#12-harden-next-revisiting-trade-offs--extensions) extension applies.
+relevant [§14](#14-harden-next-revisiting-trade-offs--extensions) extension applies.
 
 - **Filters are type/source + flat payload.** Subscriptions predominantly specify a
   `type` and/or `source` (not mostly wildcards), and payload conditions are on
@@ -52,7 +52,7 @@ Each base-design choice, why we made it, what we give up, and where we revisit i
    - *Why:* one system to run; ACID transactions enable the outbox pattern; `jsonb`
      handles arbitrary payloads/filters; great audit query support.
    - *Trade-off:* not a best-in-class queue or high-write-throughput engine.
-   - *Revisited in* [§12.2](#122-managed-queue-as-the-fanout-backbone).
+   - *Revisited in* [§14.2](#142-managed-queue-as-the-fanout-backbone).
 
 2. **DB-as-queue: transactional outbox + `FOR UPDATE SKIP LOCKED`** (vs. a real
    message broker).
@@ -61,7 +61,7 @@ Each base-design choice, why we made it, what we give up, and where we revisit i
      dependency.
    - *Trade-off:* polling overhead; throughput ceiling vs. a broker; no native delayed
      messages (we model retry timing with `next_attempt_at`).
-   - *Revisited in* [§12.2](#122-managed-queue-as-the-fanout-backbone).
+   - *Revisited in* [§14.2](#142-managed-queue-as-the-fanout-backbone).
 
 3. **Per-event indexed SQL match** (vs. an in-memory subscription cache).
    - *Why:* always fresh (no staleness), no warm-up/reconcile, no multi-pod cache
@@ -71,7 +71,7 @@ Each base-design choice, why we made it, what we give up, and where we revisit i
    - *Trade-off:* a DB round-trip on the ingest hot path; degrades if filters are
      mostly wildcards (pre-filter returns most of the table) or the subscription set
      is huge.
-   - *Revisited in* [§12.1](#121-subscription-read-through-cache).
+   - *Revisited in* [§14.1](#141-subscription-read-through-cache).
 
 4. **Denormalize `type`/`source` onto `subscriptions`** (vs. matching on the `filter`
    JSON directly).
@@ -86,18 +86,18 @@ Each base-design choice, why we made it, what we give up, and where we revisit i
      dual-write; simplest correct design.
    - *Trade-off:* ingest latency grows with the number of matches; a very large fanout
      slows the request.
-   - *Revisited in* [§12.2](#122-managed-queue-as-the-fanout-backbone) (move fanout
+   - *Revisited in* [§14.2](#142-managed-queue-as-the-fanout-backbone) (move fanout
      async behind a relay).
 
 6. **At-least-once delivery** (vs. at-most-once / exactly-once).
    - *Why:* deliveries are persisted before sending, so nothing is lost on crash.
    - *Trade-off:* subscribers may see duplicates and must dedupe on delivery `id`.
-   - *Revisited in* [§12.3](#123-other-extensions) (idempotency-key handshake).
+   - *Revisited in* [§14.3](#143-other-extensions) (idempotency-key handshake).
 
 7. **In-process worker pool** (vs. a separate worker service).
    - *Why:* one binary, one deployment, shared code/config; easy local + DOKS run.
    - *Trade-off:* API and workers scale together, not independently.
-   - *Revisited in* [§12.2](#122-managed-queue-as-the-fanout-backbone) (queue consumers
+   - *Revisited in* [§14.2](#142-managed-queue-as-the-fanout-backbone) (queue consumers
      as their own deployment).
 
 8. **Soft-delete subscriptions (`active = false`)** (vs. hard delete).
@@ -116,7 +116,15 @@ Each base-design choice, why we made it, what we give up, and where we revisit i
       strongly consistent with writes.
     - *Trade-off:* heavy audit traffic competes with ingest/worker load on one DB; no
       retention strategy means `delivery_attempts` grows unbounded.
-    - *Revisited in* [§12.3](#123-other-extensions).
+    - *Revisited in* [§14.3](#143-other-extensions).
+
+11. **Idempotent ingestion via a client-supplied key** (vs. blindly inserting every
+    request).
+    - *Why:* a client that retries after a lost `202` (the crash-after-commit window)
+      must not create a duplicate event/fanout. A `UNIQUE` constraint on
+      `idempotency_key` with `ON CONFLICT DO NOTHING` makes `POST /events` safe to retry.
+    - *Trade-off:* clients must supply a stable key to get the guarantee; requests
+      without a key fall back to non-idempotent insert.
 
 ## 4. High-level flow
 
@@ -148,17 +156,22 @@ flowchart LR
 Step-by-step, with the data-model state after each step (assume one matching
 subscription `sub-1`):
 
-1. **`POST /events`** — client submits an event. The API validates the body
-   (required `type`, `source`; `payload` is valid JSON). No writes yet.
+1. **`POST /events`** — client submits an event with an **`Idempotency-Key`** header
+   (or an `id` in the body). The API validates the body (required `type`, `source`;
+   `payload` is valid JSON). No writes yet.
 
    _Data model: unchanged._
 
-2. **Begin transaction + insert event** into the `events` table.
+2. **Begin transaction + insert event** into the `events` table with the
+   `idempotency_key`. The insert uses `ON CONFLICT (idempotency_key) DO NOTHING`; if the
+   key was seen before, we **short-circuit** — skip steps 3–5 and return the existing
+   `event_id` (no duplicate event, no duplicate deliveries). This makes ingestion safe
+   under client retries (see [§3.11](#3-design-decisions--trade-offs)).
 
    ```text
    events
-   id        type           source        payload                  created_at
-   evt-1     order.created  checkout-svc   {"amount":120,...}       16:00:00Z
+   id        idempotency_key  type           source        payload              created_at
+   evt-1     ik-abc           order.created  checkout-svc   {"amount":120,...}   16:00:00Z
    ```
 
 3. **Match subscriptions** — query candidate subscriptions from Postgres with an
@@ -193,14 +206,20 @@ sequenceDiagram
     participant C as Client
     participant API as REST API (Matcher)
     participant DB as Postgres
-    C->>API: POST /events
-    API->>DB: BEGIN; INSERT event (evt-1)
-    API->>DB: SELECT candidate subs WHERE active AND type/source match
-    DB-->>API: [sub-1]
-    API->>API: evaluate payload predicates -> [sub-1]
-    API->>DB: INSERT delivery (dlv-1, status=pending)
-    API->>DB: COMMIT
-    API-->>C: 202 Accepted {event_id: evt-1}
+    C->>API: POST /events (Idempotency-Key: ik-abc)
+    API->>DB: BEGIN; INSERT event (evt-1) ON CONFLICT (idempotency_key) DO NOTHING
+    alt key already seen (duplicate request)
+        DB-->>API: existing event_id
+        API->>DB: COMMIT
+        API-->>C: 202 Accepted {event_id} (no new deliveries)
+    else new event
+        API->>DB: SELECT candidate subs WHERE active AND type/source match
+        DB-->>API: [sub-1]
+        API->>API: evaluate payload predicates -> [sub-1]
+        API->>DB: INSERT delivery (dlv-1, status=pending)
+        API->>DB: COMMIT
+        API-->>C: 202 Accepted {event_id: evt-1}
+    end
 ```
 
 ### Delivery path (asynchronous)
@@ -364,6 +383,44 @@ sequenceDiagram
     Note over C,DB: GET /subscriptions -> SELECT WHERE active (read-only)
 ```
 
+### Service lifecycle: readiness & graceful shutdown
+
+How the service comes up behind Kubernetes probes and shuts down without dropping
+in-flight work.
+
+**Startup & readiness**
+
+- `GET /healthz` (**liveness**) — process is up; returns `200` as soon as the HTTP
+  server is listening. Kubernetes restarts the pod if this fails.
+- `GET /readyz` (**readiness**) — returns `200` only when the pod can actually serve:
+  DB pool established and a `SELECT 1` succeeds, and migrations have been applied.
+  Kubernetes withholds traffic until `/readyz` passes, so we never accept `/events`
+  against an unreachable DB. (When the [§14.1](#141-subscription-read-through-cache)
+  cache extension is added, readiness also gates on the cache warm-up completing.)
+- On a DB outage, `/readyz` flips to `503` so the pod is pulled from the Service
+  endpoints until Postgres is reachable again.
+
+**Graceful shutdown (`SIGTERM`)**
+
+On `SIGTERM` (rolling deploy, scale-down, pod eviction) the service drains rather than
+dropping work:
+
+1. Flip `/readyz` to `503` and stop accepting new HTTP requests (stop the listener after
+   in-flight requests finish, bounded by a shutdown timeout).
+2. Signal delivery workers to **stop claiming** new deliveries; let in-flight webhook
+   attempts finish (or hit their per-request timeout), then commit their result.
+3. Close the DB pool and exit.
+
+A bounded shutdown deadline (e.g. matching the pod's `terminationGracePeriodSeconds`)
+caps the drain. Because work is durable in Postgres, anything not finished stays
+`pending`/`retrying` and is re-claimed after restart.
+
+**`SIGKILL` / hard crash**
+
+No drain is possible. In-flight worker transactions roll back (locks released), and
+deliveries are re-claimed on restart. This preserves at-least-once at the cost of a
+possible duplicate (subscriber dedupes on delivery `id`).
+
 ## 5. Components
 
 | Component | Responsibility |
@@ -372,13 +429,14 @@ sequenceDiagram
 | **Store** (Postgres via `pgx`) | Durable persistence; events, subscriptions, deliveries, attempts |
 | **Matcher** | Per event: indexed SQL pre-filter on `(type, source)`, then evaluates payload predicates in Go on the candidate set |
 | **Worker pool** | Claims due deliveries, sends webhooks, applies retry/backoff |
-| **Observability** | Structured logs, `/healthz`, `/readyz`, basic Prometheus `/metrics` |
+| **Observability** | Structured JSON logs (`slog`) to stdout/stderr, `/healthz`, `/readyz` (see [§13](#13-observability)) |
 
 ## 6. Data model (Postgres)
 
 ```sql
 events(
   id uuid pk, type text, source text, payload jsonb,
+  idempotency_key text,   -- client-supplied; UNIQUE, nullable (multiple NULLs allowed)
   created_at timestamptz
 )
 
@@ -410,6 +468,9 @@ delivery_attempts(
 ```
 
 Indexes:
+- `events(idempotency_key)` `UNIQUE` — enforces idempotent ingestion
+  ([§3.11](#3-design-decisions--trade-offs)); Postgres allows multiple `NULL`s so a key
+  is optional.
 - `subscriptions(type, source) WHERE active` — selective pre-filter for the per-event
   match query (the key index that makes the no-cache design viable).
 - `deliveries(status, next_attempt_at)` — worker claim query.
@@ -419,12 +480,12 @@ Indexes:
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/events` | Ingest an event → `202 {event_id}` |
+| `POST` | `/events` | Ingest an event (optional `Idempotency-Key` header) → `202 {event_id}` |
 | `POST` | `/subscriptions` | Create subscription |
 | `GET` | `/subscriptions` | List subscriptions |
 | `DELETE` | `/subscriptions/{id}` | Delete (soft) subscription |
 | `GET` | `/deliveries?event_id=` / `?subscription_id=` | Delivery state + history (audit) |
-| `GET` | `/healthz`, `/readyz`, `/metrics` | Ops |
+| `GET` | `/healthz`, `/readyz` | Ops (metrics in [§14.3](#143-other-extensions)) |
 
 ### Event body
 
@@ -451,9 +512,9 @@ are expected to set `type`/`source` and use flat payload conditions.)
 - `payload`: map of top-level keys to either a literal (equality) or one operator
   object: `eq`, `gt`, `gte`, `lt`, `lte`. (Top-level keys only in the time-boxed build.)
 
-## 9. Delivery guarantees & failure modes
+## 9. Delivery guarantees
 
-**Guarantee: at-least-once per subscriber.**
+**At-least-once per subscriber.**
 
 - A delivery is committed to the DB before the worker attempts it, so a crash mid-send
   cannot lose it — it remains `pending`/`retrying` and is re-claimed.
@@ -462,7 +523,7 @@ are expected to set `type`/`source` and use flat payload conditions.)
 - Retries: exponential backoff (e.g. `base * 2^attempt`, capped) up to `max_attempts`,
   then `failed`.
 
-### Why not at-most-once or exactly-once
+**Why not at-most-once or exactly-once:**
 
 - **At-most-once** would require marking a delivery done *before* sending (or not
   retrying), which risks silently losing notifications — unacceptable for this service.
@@ -470,29 +531,84 @@ are expected to set `type`/`source` and use flat payload conditions.)
   subscriber cooperation: HTTP delivery + our crash window means the receiver can always
   observe a duplicate. We therefore target at-least-once and push **effective
   exactly-once to the subscriber** via an idempotency key (delivery `id`); a server-side
-  handshake is an extension ([§12.3](#123-other-extensions)).
+  handshake is an extension ([§14.3](#143-other-extensions)).
 
-### Failure modes & recovery
+Per-path and infrastructure failure scenarios are enumerated in
+[§10 Failure modes](#10-failure-modes).
 
-| Failure | System behavior | Guarantee impact | Recovery / mitigation |
-|---|---|---|---|
-| API crashes **before** ingest commit | Transaction rolls back; no event/deliveries persisted | None (nothing accepted) | Client receives no `202` → client retries |
-| API crashes **after** commit, before `202` reaches client | Event + deliveries are durable; client never saw the ack | Possible **duplicate event** if client retries (ingest is not idempotent) | Idempotency key on ingest ([§12.3](#123-other-extensions)) |
-| Postgres unavailable at ingest | Ingest returns `5xx` (fail-closed) | None (not accepted, not dropped) | Client retries; availability coupled to DB ([§3.9](#3-design-decisions--trade-offs)) |
-| Worker crashes **after** webhook `2xx`, before marking `delivered` | Row stays `pending`/`retrying`, gets re-claimed and re-sent | **Duplicate** at subscriber | Subscriber dedupes on delivery `id` |
-| Worker crashes mid-send (before attempt recorded) | Claim transaction rolls back; row lock released | None | Row re-claimed by another worker |
-| Webhook returns non-2xx / times out | Attempt recorded; `attempts++`, backoff, `status=retrying` | Delayed delivery | Exponential backoff up to `max_attempts` |
-| Webhook permanently down / poison endpoint | Retries exhausted → `status=failed` (dead-lettered in place) | Not delivered (visible in audit) | Operator inspects via `GET /deliveries`; replay/manual ([§12.3](#123-other-extensions)) |
-| Postgres unavailable during delivery | Worker tx fails; delivery stays in current state | None (no false `delivered`) | Retried when DB recovers |
-| Hung webhook holds row lock (long HTTP call) | Row locked for the duration of the worker tx | Reduced worker throughput | Bounded by per-request HTTP **timeout** |
-| Two workers claim the same row | Prevented by `FOR UPDATE SKIP LOCKED` | None (no double-claim) | N/A (by construction) |
+## 10. Failure modes
 
-> Note: with the [§12.2](#122-managed-queue-as-the-fanout-backbone) queue extension, two
-> additional failure modes appear — **outbox relay lag** (event committed but not yet
-> published) and **queue unavailability** (ingest still succeeds because it only writes
-> the outbox; fanout resumes when the queue recovers).
+Failure scenarios across the whole base design and how the service behaves. The guiding
+principles are: **fail closed on ingest** (never accept-then-drop), **never mark
+`delivered` without a real 2xx**, and **make every terminal failure visible in the audit
+store**.
 
-## 10. Deployment (DOKS)
+The **Handled in** column states whether the base design addresses the failure (`Base`)
+or it is deferred to a [§14](#14-harden-next-revisiting-trade-offs--extensions)
+extension (`Future`).
+
+### 10.1 Ingest path
+
+| Failure | System behavior | Impact | Recovery / mitigation | Handled in |
+|---|---|---|---|---|
+| Malformed body / missing `type`/`source` / invalid JSON | Reject with `400`, no writes | None | Client fixes request | Base |
+| API crashes **before** commit | Transaction rolls back; nothing persisted | None (not accepted) | No `202` → client retries | Base |
+| API crashes **after** commit, before `202` reaches client | Event + deliveries durable; client never saw ack | Client retry would duplicate, but is **de-duplicated** | `ON CONFLICT (idempotency_key) DO NOTHING` returns existing `event_id` ([§3.11](#3-design-decisions--trade-offs)) | Base |
+| Postgres unavailable at ingest | Return `5xx` (fail-closed) | None (not accepted, not dropped) | Client retries; ingest availability coupled to DB ([§3.9](#3-design-decisions--trade-offs)) | Base |
+| Very large fanout (many matches) in one tx | Ingest latency grows with match count | Slower `202` | Async fanout via queue ([§14.2](#142-managed-queue-as-the-fanout-backbone)) | Future |
+
+### 10.2 Subscription management
+
+| Failure | System behavior | Impact | Recovery / mitigation | Handled in |
+|---|---|---|---|---|
+| Invalid webhook URL / unparseable filter | Reject with `400`, no writes | None | Client fixes request; validated at write time | Base |
+| Postgres unavailable on create/delete | Return `5xx`, no change | None | Client retries | Base |
+| Subscription created **after** an event was ingested | Event already matched against the old set; new sub won't get past events | No retroactive delivery (by design) | Replay API for backfill ([§14.3](#143-other-extensions)) | Base (by design); backfill Future |
+| Delete (`active=false`) while deliveries already created for in-flight event | Existing `deliveries` rows still attempt | Subscriber may receive events queued just before delete | Deletes affect *future* matching only | Base (by design) |
+
+### 10.3 Matching
+
+| Failure | System behavior | Impact | Recovery / mitigation | Handled in |
+|---|---|---|---|---|
+| Stored `filter` JSON malformed | Caught at write time (validation), so match-time parse is safe | None | Validate on create; skip + log if ever encountered | Base |
+| `type`/`source` denormalized columns drift from `filter` | Wrong candidate set from pre-filter | Missed / extra candidates | Single writer keeps them in sync ([§3.4](#3-design-decisions--trade-offs)) | Base |
+| Wildcard-heavy filters | Pre-filter returns most of the table | Slow match | Read-through cache ([§14.1](#141-subscription-read-through-cache)) | Future |
+
+### 10.4 Delivery path
+
+| Failure | System behavior | Impact | Recovery / mitigation | Handled in |
+|---|---|---|---|---|
+| Worker crashes **after** webhook `2xx`, before marking `delivered` | Row stays `pending`/`retrying`, re-claimed and re-sent | **Duplicate** at subscriber | Subscriber dedupes on delivery `id`; server-side handshake ([§14.3](#143-other-extensions)) | Base (at-least-once); effective-once Future |
+| Worker crashes mid-send (before attempt recorded) | Claim tx rolls back; row lock released | None | Re-claimed by another worker | Base |
+| Webhook returns non-2xx / times out | Attempt recorded; `attempts++`, backoff, `status=retrying` | Delayed delivery | Exponential backoff to `max_attempts` | Base |
+| Webhook permanently down / poison endpoint | Retries exhausted → `status=failed` (dead-lettered in place) | Not delivered (visible in audit) | Inspect via `GET /deliveries`; dedicated DLQ ([§14.3](#143-other-extensions)) | Base |
+| Postgres unavailable during delivery | Worker tx fails; delivery unchanged | None (no false `delivered`) | Retried when DB recovers | Base |
+| Hung webhook holds row lock (long HTTP call) | Row locked for the worker tx duration | Reduced worker throughput | Bounded by per-request HTTP **timeout** | Base |
+| Two workers claim the same row | Prevented by `FOR UPDATE SKIP LOCKED` | None (no double-claim) | By construction | Base |
+
+### 10.5 Audit & read path
+
+| Failure | System behavior | Impact | Recovery / mitigation | Handled in |
+|---|---|---|---|---|
+| Missing/ambiguous query params (neither/both `event_id` & `subscription_id`) | Reject with `400` | None | Client fixes request | Base |
+| Postgres unavailable | Return `5xx` | None | Client retries | Base |
+| `delivery_attempts` grows unbounded | Slower audit queries over time | Degraded reads | Retention/archival + read replica ([§14.3](#143-other-extensions)) | Future |
+
+### 10.6 Infrastructure & lifecycle
+
+| Failure | System behavior | Impact | Recovery / mitigation | Handled in |
+|---|---|---|---|---|
+| `SIGTERM` on pod restart / rolling deploy | Graceful shutdown: stop accepting, drain in-flight deliveries, then exit | None | See [Service lifecycle](#service-lifecycle-readiness--graceful-shutdown) | Base |
+| `SIGKILL` / hard crash (no graceful drain) | In-flight worker tx rolls back; deliveries re-claimed | Possible duplicate (at-least-once) | Re-claim on restart; subscriber dedupes | Base |
+| Postgres failover / brief outage | Ingest fails closed; workers/readers retry | Temporary unavailability, no data loss | Retries; `/readyz` gates traffic until DB reachable | Base |
+| Clock skew across pods | Affects `next_attempt_at` comparison | Slightly early/late retries | Rely on DB `now()` where possible | Base |
+
+> Note: the [§14.2](#142-managed-queue-as-the-fanout-backbone) queue extension adds two
+> failure modes — **outbox relay lag** (event committed but not yet published) and
+> **queue unavailability** (ingest still succeeds because it only writes the outbox;
+> fanout resumes when the queue recovers).
+
+## 11. Deployment (DOKS)
 
 - Containerized Go binary (multi-stage `Dockerfile`).
 - Kubernetes manifests (`Deployment`, `Service`, `ConfigMap`/`Secret`) applied to a
@@ -501,7 +617,7 @@ are expected to set `type`/`source` and use flat payload conditions.)
   connection string injected via Secret.
 - DB schema applied via migrations on startup.
 
-## 11. Testing & CI
+## 12. Testing & CI
 
 - **Unit:** matcher logic, backoff calculation, filter parsing.
 - **Integration:** API + Postgres (via `testcontainers` or a CI Postgres service)
@@ -509,12 +625,25 @@ are expected to set `type`/`source` and use flat payload conditions.)
 - **CI:** GitHub Actions on push: `go vet`, `go test ./...` with a Postgres service
   container.
 
-## 12. Harden next: revisiting trade-offs & extensions
+## 13. Observability
+
+- **Structured logging (base):** the service emits **JSON logs via Go's `log/slog`** to
+  **stdout/stderr**, so the container runtime / DOKS log pipeline collects and indexes
+  them with no extra infra. Logs across the ingest → fanout → delivery → audit path carry
+  correlating fields (event id, delivery id, subscription id, status, attempt count, HTTP
+  status, duration) for traceability.
+- **Health/readiness (base):** `/healthz` and `/readyz`
+  (see [Service lifecycle](#service-lifecycle-readiness--graceful-shutdown)).
+- **Future hardening:** export **metrics** (e.g. Prometheus `/metrics`: ingest rate,
+  fanout size, delivery success/failure counts, retry depth) plus distributed tracing and
+  alerting on `failed` delivery rate — see [§14.3](#143-other-extensions).
+
+## 14. Harden next: revisiting trade-offs & extensions
 
 Each base-design trade-off from [§3](#3-design-decisions--trade-offs) and the concrete
 extension that addresses it.
 
-### 12.1 Subscription read-through cache
+### 14.1 Subscription read-through cache
 
 **Revisits [§3.3](#3-design-decisions--trade-offs).** When filters become wildcard-heavy
 (pre-filter loses selectivity) or the subscription set / ingest rate grows enough that
@@ -535,7 +664,7 @@ What this re-introduces (and must be designed for):
 *Trade-off of adding it:* lower match latency at the cost of staleness windows and the
 cache-coherence complexity the base design deliberately avoids.
 
-### 12.2 Managed queue as the fanout backbone
+### 14.2 Managed queue as the fanout backbone
 
 **Revisits [§3.1](#3-design-decisions--trade-offs), [§3.2](#3-design-decisions--trade-offs),
 [§3.5](#3-design-decisions--trade-offs), [§3.7](#3-design-decisions--trade-offs).** For
@@ -590,16 +719,13 @@ failure modes to document: relay lag (event committed, not yet published) and qu
 unavailability (ingest still succeeds because it only writes the outbox). **Kafka
 partitioning** also sets up the per-source ordering extension below.
 
-### 12.3 Other extensions
+### 14.3 Other extensions
 
 - **Effectively-once at the subscriber** — idempotency-key handshake / dedup store
   (revisits [§3.6](#3-design-decisions--trade-offs)).
 - **Per-source ordered delivery** — partition by `source` (natural on Kafka from
-  [§12.2](#122-managed-queue-as-the-fanout-backbone)); serialize a source's deliveries
+  [§14.2](#142-managed-queue-as-the-fanout-backbone)); serialize a source's deliveries
   to a subscriber.
-- **Idempotent ingestion** — accept a client-supplied idempotency key (or dedupe on a
-  natural event id) so a client retry after a lost `202` doesn't create a duplicate
-  event (revisits the ingest-crash failure mode in [§9](#9-delivery-guarantees--failure-modes)).
 - **Replay API** — re-deliver events over a time range from the durable `events` store
   (useful after a subscriber outage).
 - **Richer filters** — nested `AND`/`OR` expressions, nested payload paths.
