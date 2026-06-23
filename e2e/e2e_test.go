@@ -268,19 +268,24 @@ func (m *memoryStore) UpdateDeliveryStatus(_ context.Context, id int64, status s
 }
 
 func TestE2EIngestFanoutDeliveredAudit(t *testing.T) {
+	t.Logf("step=setup action=create in-memory store and API test server")
 	mem := newMemoryStore()
 	router := api.NewRouter(mem, matcher.New())
 	apiServer := httptest.NewServer(router)
 	defer apiServer.Close()
 
+	t.Logf("step=setup action=create webhook stub expected_http_status=200")
 	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`ok`))
 	}))
 	defer webhook.Close()
 
+	t.Logf("step=subscription action=create filter=type+source+amount_gt_100 expected=201")
 	createSubscription(t, apiServer.URL, webhook.URL, `{"type":"order.created","source":"checkout-svc","payload":{"amount":{"gt":100}}}`)
+	t.Logf("step=event action=ingest expected=202+fanout_to_single_subscription")
 	eventID := ingestEvent(t, apiServer.URL, "ik-success", `{"type":"order.created","source":"checkout-svc","payload":{"amount":120}}`)
+	t.Logf("step=event result=accepted event_id=%d expected_fanout_count=1", eventID)
 
 	wp := worker.NewPool(mem, &http.Client{}, worker.Config{
 		WorkerCount:    1,
@@ -291,14 +296,18 @@ func TestE2EIngestFanoutDeliveredAudit(t *testing.T) {
 		BaseBackoff:    1 * time.Millisecond,
 		MaxBackoff:     5 * time.Millisecond,
 	})
+	t.Logf("step=worker action=process delivery batch runs=5 expected=delivery transitions to delivered")
 	for i := 0; i < 5; i++ {
-		_, _ = wp.ProcessOnce(context.Background())
+		n, err := wp.ProcessOnce(context.Background())
+		t.Logf("step=worker iteration=%d claimed=%d err=%v", i+1, n, err)
 	}
 
 	items := fetchAuditByEventID(t, apiServer.URL, eventID)
+	t.Logf("step=audit observed_deliveries=%d expected_deliveries=1", len(items))
 	if len(items) != 1 {
 		t.Fatalf("deliveries len = %d, want 1", len(items))
 	}
+	t.Logf("step=audit observed_status=%s expected_status=delivered observed_attempts=%d expected_attempts=1", items[0].Delivery.Status, len(items[0].Attempts))
 	if items[0].Delivery.Status != "delivered" {
 		t.Fatalf("status = %s, want delivered", items[0].Delivery.Status)
 	}
@@ -308,19 +317,24 @@ func TestE2EIngestFanoutDeliveredAudit(t *testing.T) {
 }
 
 func TestE2EFailingWebhookRetriesThenFailed(t *testing.T) {
+	t.Logf("step=setup action=create in-memory store and API test server")
 	mem := newMemoryStore()
 	router := api.NewRouter(mem, matcher.New())
 	apiServer := httptest.NewServer(router)
 	defer apiServer.Close()
 
+	t.Logf("step=setup action=create webhook stub expected_http_status=500")
 	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte(`fail`))
 	}))
 	defer webhook.Close()
 
+	t.Logf("step=subscription action=create filter=type+source expected=201")
 	createSubscription(t, apiServer.URL, webhook.URL, `{"type":"order.created","source":"checkout-svc"}`)
+	t.Logf("step=event action=ingest expected=202")
 	eventID := ingestEvent(t, apiServer.URL, "ik-fail", `{"type":"order.created","source":"checkout-svc","payload":{"amount":80}}`)
+	t.Logf("step=event result=accepted event_id=%d expected_final_status=failed after max attempts", eventID)
 
 	wp := worker.NewPool(mem, &http.Client{}, worker.Config{
 		WorkerCount:    1,
@@ -335,8 +349,19 @@ func TestE2EFailingWebhookRetriesThenFailed(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	var items []auditItem
 	for time.Now().Before(deadline) {
-		_, _ = wp.ProcessOnce(context.Background())
+		n, err := wp.ProcessOnce(context.Background())
 		items = fetchAuditByEventID(t, apiServer.URL, eventID)
+		if len(items) > 0 {
+			t.Logf(
+				"step=retry-loop claimed=%d err=%v observed_status=%s observed_attempts=%d expected_terminal_status=failed",
+				n,
+				err,
+				items[0].Delivery.Status,
+				len(items[0].Attempts),
+			)
+		} else {
+			t.Logf("step=retry-loop claimed=%d err=%v observed_deliveries=0", n, err)
+		}
 		if len(items) == 1 && items[0].Delivery.Status == "failed" {
 			break
 		}
@@ -357,11 +382,13 @@ func TestE2EFailingWebhookRetriesThenFailed(t *testing.T) {
 func createSubscription(t *testing.T, apiURL, webhookURL, filter string) {
 	t.Helper()
 	body := fmt.Sprintf(`{"webhook_url":%q,"filter":%s}`, webhookURL, filter)
+	t.Logf("action=http_request method=POST path=/subscriptions body=%s", body)
 	resp, err := http.Post(apiURL+"/subscriptions", "application/json", bytes.NewBufferString(body))
 	if err != nil {
 		t.Fatalf("create subscription request: %v", err)
 	}
 	defer resp.Body.Close()
+	t.Logf("action=http_response method=POST path=/subscriptions status=%d expected=201", resp.StatusCode)
 	if resp.StatusCode != http.StatusCreated {
 		b, _ := io.ReadAll(resp.Body)
 		t.Fatalf("create subscription status=%d body=%s", resp.StatusCode, string(b))
@@ -370,6 +397,7 @@ func createSubscription(t *testing.T, apiURL, webhookURL, filter string) {
 
 func ingestEvent(t *testing.T, apiURL, idempotencyKey, body string) int64 {
 	t.Helper()
+	t.Logf("action=http_request method=POST path=/events idempotency_key=%s body=%s", idempotencyKey, body)
 	req, err := http.NewRequest(http.MethodPost, apiURL+"/events", bytes.NewBufferString(body))
 	if err != nil {
 		t.Fatalf("new ingest request: %v", err)
@@ -381,6 +409,7 @@ func ingestEvent(t *testing.T, apiURL, idempotencyKey, body string) int64 {
 		t.Fatalf("ingest request: %v", err)
 	}
 	defer resp.Body.Close()
+	t.Logf("action=http_response method=POST path=/events status=%d expected=202", resp.StatusCode)
 	if resp.StatusCode != http.StatusAccepted {
 		b, _ := io.ReadAll(resp.Body)
 		t.Fatalf("ingest status=%d body=%s", resp.StatusCode, string(b))
@@ -393,6 +422,7 @@ func ingestEvent(t *testing.T, apiURL, idempotencyKey, body string) int64 {
 	if !ok {
 		t.Fatalf("missing event_id in response: %#v", payload)
 	}
+	t.Logf("action=parse_response path=/events event_id=%d fanout_count=%v idempotent_replay=%v", int64(eventID), payload["fanout_count"], payload["idempotent_replay"])
 	return int64(eventID)
 }
 
@@ -403,11 +433,13 @@ type auditItem struct {
 
 func fetchAuditByEventID(t *testing.T, apiURL string, eventID int64) []auditItem {
 	t.Helper()
+	t.Logf("action=http_request method=GET path=/deliveries?event_id=%d", eventID)
 	resp, err := http.Get(fmt.Sprintf("%s/deliveries?event_id=%d", apiURL, eventID))
 	if err != nil {
 		t.Fatalf("audit request: %v", err)
 	}
 	defer resp.Body.Close()
+	t.Logf("action=http_response method=GET path=/deliveries status=%d expected=200", resp.StatusCode)
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
 		t.Fatalf("audit status=%d body=%s", resp.StatusCode, string(b))
@@ -418,5 +450,6 @@ func fetchAuditByEventID(t *testing.T, apiURL string, eventID int64) []auditItem
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		t.Fatalf("decode audit response: %v", err)
 	}
+	t.Logf("action=parse_response path=/deliveries deliveries=%d", len(payload.Deliveries))
 	return payload.Deliveries
 }

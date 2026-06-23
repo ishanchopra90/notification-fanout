@@ -2,7 +2,7 @@ MODULE := github.com/notification-fanout/service
 BINARY := bin/notification-fanout
 DATABASE_URL ?= postgres://postgres:postgres@localhost:5432/notification_fanout?sslmode=disable
 
-.PHONY: run lint build test e2e migrate tidy
+.PHONY: run lint build test e2e e2e-verbose migrate tidy
 
 run: build
 	./$(BINARY)
@@ -24,6 +24,9 @@ test:
 
 e2e:
 	go test ./e2e/...
+
+e2e-verbose:
+	go test -v ./e2e/...
 
 migrate:
 	@if [ -z "$(DATABASE_URL)" ]; then \
