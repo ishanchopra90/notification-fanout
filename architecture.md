@@ -425,7 +425,7 @@ possible duplicate (subscriber dedupes on delivery `id`).
 
 | Component | Responsibility |
 |---|---|
-| **HTTP API** (`net/http` + `chi`) | Request handling, validation, JSON I/O |
+| **HTTP API** (`net/http` + `chi`) | Routing, request handling, validation, JSON I/O; `chi` middleware for request id, panic recovery, timeout, and `slog` request logging |
 | **Store** (Postgres via `pgx`) | Durable persistence; events, subscriptions, deliveries, attempts |
 | **Matcher** | Per event: indexed SQL pre-filter on `(type, source)`, then evaluates payload predicates in Go on the candidate set |
 | **Worker pool** | Claims due deliveries, sends webhooks, applies retry/backoff |
@@ -632,6 +632,10 @@ extension (`Future`).
   them with no extra infra. Logs across the ingest → fanout → delivery → audit path carry
   correlating fields (event id, delivery id, subscription id, status, attempt count, HTTP
   status, duration) for traceability.
+- **Request logging (base):** HTTP requests are logged via **`chi` middleware** wired to
+  `slog` — a `RequestID` plus method, path, status, and duration per request — alongside
+  `Recoverer` (panic → `500` + logged) and a request `Timeout`. This is the per-request
+  half of the structured logging above.
 - **Health/readiness (base):** `/healthz` and `/readyz`
   (see [Service lifecycle](#service-lifecycle-readiness--graceful-shutdown)).
 - **Future hardening:** export **metrics** (e.g. Prometheus `/metrics`: ingest rate,
