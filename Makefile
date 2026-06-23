@@ -2,7 +2,7 @@ MODULE := github.com/notification-fanout/service
 BINARY := bin/notification-fanout
 DATABASE_URL ?= postgres://postgres:postgres@localhost:5432/notification_fanout?sslmode=disable
 
-.PHONY: run lint build test e2e e2e-verbose e2econtainer migrate tidy
+.PHONY: run lint build test e2e e2e-verbose e2econtainer e2elocaldb ensure-local-postgres migrate tidy
 
 run: build
 	./$(BINARY)
@@ -53,6 +53,49 @@ e2econtainer:
 	DATABASE_URL="postgres://postgres:postgres@127.0.0.1:$$HOST_PORT/notification_fanout?sslmode=disable"; \
 	echo "Running DB-backed local e2e with DATABASE_URL=$$DATABASE_URL"; \
 	DATABASE_URL="$$DATABASE_URL" go test -v -count=1 -tags localdb ./e2edb/...
+
+e2elocaldb: ensure-local-postgres
+	@if [ -z "$(DATABASE_URL)" ]; then \
+		echo "DATABASE_URL is required (e.g. make e2elocaldb DATABASE_URL=...)"; \
+		exit 1; \
+	fi
+	@echo "Running DB-backed local e2e with existing DATABASE_URL=$(DATABASE_URL)"
+	DATABASE_URL="$(DATABASE_URL)" go test -v -count=1 -tags localdb ./e2edb/...
+
+ensure-local-postgres:
+	@if ! command -v pg_isready >/dev/null 2>&1 || ! command -v psql >/dev/null 2>&1; then \
+		echo "Postgres tools not found; installing postgresql + postgresql-client..."; \
+		if ! command -v apt-get >/dev/null 2>&1; then \
+			echo "apt-get not found. Install Postgres manually, then rerun make e2elocaldb."; \
+			exit 1; \
+		fi; \
+		sudo apt-get update && sudo apt-get install -y postgresql postgresql-client; \
+	fi
+	@if pg_isready -h localhost -p 5432 -U postgres -d notification_fanout >/dev/null 2>&1; then \
+		echo "Local Postgres already running and reachable"; \
+	else \
+		echo "Local Postgres not reachable; attempting to start service..."; \
+		if command -v systemctl >/dev/null 2>&1; then \
+			sudo systemctl start postgresql || true; \
+		fi; \
+		if command -v service >/dev/null 2>&1; then \
+			sudo service postgresql start || true; \
+		fi; \
+		for i in 1 2 3 4 5 6 7 8 9 10; do \
+			if pg_isready -h localhost -p 5432 -U postgres >/dev/null 2>&1; then \
+				break; \
+			fi; \
+			sleep 1; \
+			if [ "$$i" -eq 10 ]; then \
+				echo "Could not start local Postgres automatically. Start it manually, then re-run make e2elocaldb."; \
+				exit 1; \
+			fi; \
+		done; \
+	fi
+	@echo "Ensuring postgres password and notification_fanout database exist..."
+	@sudo -u postgres psql -v ON_ERROR_STOP=1 -c "ALTER USER postgres PASSWORD 'postgres';" >/dev/null 2>&1 || true
+	@sudo -u postgres psql -v ON_ERROR_STOP=1 -tc "SELECT 1 FROM pg_database WHERE datname='notification_fanout'" | grep -q 1 || \
+		sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE notification_fanout;" >/dev/null
 
 migrate:
 	@if [ -z "$(DATABASE_URL)" ]; then \
